@@ -51,7 +51,8 @@ ABBCoDelBin::ABBCoDelBin()
       m_status(INACTIVE),
       m_index(0),
       m_bwthreshold(0.0),
-      m_weight(0.0)
+      m_weight(0.0),
+      m_lastWeight(0.0)
 {
     NS_LOG_FUNCTION(this);
 }
@@ -149,11 +150,25 @@ ABBCoDelBin::IncreaseWeight(double weight)
     NS_LOG_INFO("Bin " << m_index << " weight increased from " << old_weight << " to " << m_weight);
 }
 
+void
+ABBCoDelBin::SaveLastWeight()
+{
+    NS_LOG_FUNCTION(this);
+    m_lastWeight = m_weight;
+}
+
+double
+ABBCoDelBin::GetLastWeight() const
+{
+    NS_LOG_FUNCTION(this);
+    return m_lastWeight;
+}
+
 NS_OBJECT_ENSURE_REGISTERED(ABBCoDelQueueDisc);
 
 ABBCoDelQueueDisc::FlowInfo::FlowInfo(uint32_t id, double weight)
-    : m_id(id), m_weight(weight), m_binId(0), m_alloced(false),
-      m_avgServiceRate(0.0), m_avgArrivalRate(0.0),
+    : m_id(id), m_weight(weight), m_binId(0), m_lastBinId(0), m_alloced(false),
+      m_avgServiceRate(0.0), m_avgArrivalRate(0.0), m_hrCount(0),
       m_rateWeight(0.4), m_lastSampleTime(0),
       m_nPacketsReceived(0), m_nBytesReceived(0), 
       m_nPacketsSent(0), m_nBytesSent(0)
@@ -190,6 +205,17 @@ ABBCoDelQueueDisc::FlowInfo::UpdateRates()
         m_avgArrivalRate = (1 - m_rateWeight) * m_avgArrivalRate + m_rateWeight * arrivalRateSample;
         double departureRateSample = m_nBytesSent * 8 / sampleTime / 1000000.0;     // in mbps
         m_avgServiceRate = (1 - m_rateWeight) * m_avgServiceRate + m_rateWeight * departureRateSample;
+
+        // is the flow considered unresponsive and high rate
+        if ((m_avgArrivalRate - m_avgServiceRate) / m_avgArrivalRate > 0.25)
+        {
+            m_hrCount++;
+        }
+        else
+        {
+            m_hrCount = 0;
+        }
+        NS_LOG_INFO("Flow " << m_id << " hrCount = " << m_hrCount);
     }
 
     // reset for next sample
@@ -302,7 +328,7 @@ ABBCoDelQueueDisc::DoEnqueue(Ptr<QueueDiscItem> item)
 {
     NS_LOG_FUNCTION(this << item);
 
-    // find the flow of the item
+    // find the flow of the item (and add it to its bin if it is new flow)
     FlowInfo& flow = GetFlowInfo(item);
     flow.PacketReceived(item);      // rate sample update
 
@@ -312,6 +338,7 @@ ABBCoDelQueueDisc::DoEnqueue(Ptr<QueueDiscItem> item)
     {
         NS_LOG_INFO("Inactive bin " << binId << " now becomes new bin");
         double binW = m_bins[binId]->GetWeight();
+        NS_ASSERT_MSG(binW > 0, "Bin " << binId << " weight (" << binW << ") should be positive -- logic error");
         m_bins[binId]->SetStatus(ABBCoDelBin::NEW_BIN);
         m_bins[binId]->SetDeficit(std::ceil(binW * m_quantum));
         m_newBins.push_back(m_bins[binId]);
@@ -352,6 +379,14 @@ ABBCoDelQueueDisc::DoDequeue()
             if (bin->GetDeficit() <= 0)
             {
                 double binW = bin->GetWeight();
+                //NS_ASSERT_MSG(binW > 0, "Bin " << binId << " weight (" << binW << ") should be positive -- logic error");
+                if (binW <= 0.0)    // all previous flows have been moved out of this bin
+                {
+                    // this bin may have left over packets
+                    NS_LOG_INFO("Bin " << binId << " has no weight (all flows moved out) - use last weight");
+                    binW = bin->GetLastWeight();
+                    NS_ASSERT_MSG(binW > 0, "Unexpected last bin weight -- logic error");
+                }
 
                 NS_LOG_DEBUG("Increase deficit for new-to-be-old bin index " << binId);
                 bin->IncreaseDeficit(std::ceil(binW * m_quantum));
@@ -376,6 +411,13 @@ ABBCoDelQueueDisc::DoDequeue()
             if (bin->GetDeficit() <= 0)
             {
                 double binW = bin->GetWeight();
+                if (binW <= 0.0)    // all previous flows have been moved out of this bin
+                {
+                    // this bin may have left over packets
+                    NS_LOG_INFO("Bin " << binId << " has no weight (all flows moved out) - use last weight");
+                    binW = bin->GetLastWeight();
+                    NS_ASSERT_MSG(binW > 0, "Unexpected last bin weight -- logic error");
+                }
 
                 NS_LOG_DEBUG("Increase deficit for old bin index " << binId);
                 bin->IncreaseDeficit(std::ceil(binW * m_quantum));
@@ -550,27 +592,50 @@ ABBCoDelQueueDisc::Optimize()
     for (FlowInfo& flow : m_flows)
     {
         flow.UpdateRates();
+        flow.m_lastBinId = flow.m_binId;    // save last bin ID as well
     }
 
     // To avoid skewing the threshold calculation, remove flows of:
     //      low rate or inactive
     //      flow id = 0 (currently ARP packets)
+    NS_LOG_INFO("Excluding ARP flow or low rate or inactive flows from threshold calculation");
+    double totalServiceRate = 0.0;
     for (FlowInfo& flow : m_flows)
     {
-        flow.m_alloced = (flow.m_id == 0 || flow.m_avgServiceRate <= 0.1) ? true : false;
+        flow.m_alloced = false;
+        if (flow.m_id == 0)
+        {
+            flow.m_alloced = true;
+            NS_LOG_INFO("Flow with id=0 marked as allocated, rate=" << flow.m_avgServiceRate);
+        }
+        else if (flow.m_avgServiceRate <= 0.1)
+        {
+            flow.m_alloced = true;
+            NS_LOG_INFO("Flow with id=" << flow.m_id << " marked as allocated, low rate=" << flow.m_avgServiceRate);
+        }
+        else
+        {
+            NS_LOG_INFO("Flow with id=" << flow.m_id << " to be allocated, rate=" << flow.m_avgServiceRate);
+        }
+        totalServiceRate += flow.m_avgServiceRate;
     }
+    NS_LOG_DEBUG("totalServiceRate=" << totalServiceRate);
 
-    // tentatively set all bins bandwidth thresholds to channel capacity
+    // tentatively set all bins bandwidth thresholds to channel capacity and reset bin weights
     for (uint32_t i = 0; i < m_nBins; i++)
     {
-        m_bins[i]->SetBandwidthThreshold(m_channelBW * 1.1);    // 10% safety
+        //m_bins[i]->SetBandwidthThreshold(m_channelBW * 1.1);    // 10% safety
+        m_bins[i]->SetBandwidthThreshold(totalServiceRate * 1.1);    // 10% safety
+        m_bins[i]->SaveLastWeight();    // save last bin weight as well
+        m_bins[i]->SetWeight(0.0);      // reset bin weights
     }
 
     // calculate bin bandwidth
     for (uint32_t i = 0; i < m_nBins-1; i++)    // the last bin is catch-all
     {
         double weightsUnalloced = 0.0;          // sum of weights of unalloced flows
-        double bwLeft = m_channelBW;            // bandwidth left for new allocations
+        //double bwLeft = m_channelBW;            // bandwidth left for new allocations
+        double bwLeft = totalServiceRate;       // bandwidth left for new allocations
 
         for (FlowInfo& flow : m_flows)
         {
@@ -591,14 +656,20 @@ ABBCoDelQueueDisc::Optimize()
         }
         
         double nextBwThreshold = bwLeft / weightsUnalloced;
+        NS_ASSERT(i == m_bins[i]->GetIndex());
+        NS_LOG_INFO("Bin " << i << ": nextBwThreshold=" << nextBwThreshold 
+                    << ", bwLeft=" << bwLeft 
+                    << ", weightsUnalloced=" << weightsUnalloced);
         m_bins[i]->SetBandwidthThreshold(nextBwThreshold);
 
         bool newFlowAlloced = false;
         for (FlowInfo& flow : m_flows)
         {
-            if (!flow.m_alloced && (flow.m_avgServiceRate / flow.m_weight <= nextBwThreshold))
+            double normalizedBWConsumed = flow.m_avgServiceRate / flow.m_weight;
+            if (!flow.m_alloced && normalizedBWConsumed - nextBwThreshold < 0.000001)
             {
                 flow.m_alloced = true;
+                NS_LOG_INFO("Flow with id=" << flow.m_id << " marked as allocated, rate=" << flow.m_avgServiceRate);
                 newFlowAlloced = true;
             }
         }
@@ -608,24 +679,19 @@ ABBCoDelQueueDisc::Optimize()
     }
 
     // calculate bin weights and reclassify flows
-    NS_LOG_INFO("Reset all bin weights ...");
-    for (uint32_t i = 0; i < m_nBins; i++)
-    {
-        m_bins[i]->SetWeight(0.0);
-    }
     for (FlowInfo& flow : m_flows)
     {
-        uint32_t oldBin = flow.m_binId;
-
         // flow with id = 0 or low rate or inactive goes to first bin always
         if (flow.m_id == 0 || flow.m_avgServiceRate <= 0.1)
         {
             flow.m_binId = 0;
+            NS_LOG_INFO("Id=0 or low rate flow " << flow.m_id << " is allocated to bin " << flow.m_binId);
         }
         // unresponsive, high rate flow goes to the last bin
-        else if ((flow.m_avgArrivalRate - flow.m_avgServiceRate) / flow.m_avgArrivalRate > 0.10)
+        else if (flow.m_hrCount >= 3)
         {
             flow.m_binId = m_nBins - 1;
+            NS_LOG_INFO("High rate flow " << flow.m_id << " is allocated to bin " << flow.m_binId);
         }
         // reclassify the flows into their respective bins based on consumption
         else
@@ -634,16 +700,25 @@ ABBCoDelQueueDisc::Optimize()
             flow.m_binId = m_nBins - 1;     // last bin catches all unallocated
             for (uint32_t i = 0; i < m_nBins - 1; i++)
             {
-                if (normalizedBWConsumed <= m_bins[i]->GetBandwidthThreshold())
+                if (normalizedBWConsumed - m_bins[i]->GetBandwidthThreshold() < 0.000001)
                 {
                     flow.m_binId = i;
                     break;
                 }
             }
+            NS_LOG_INFO("Normal rate flow " << flow.m_id << " is allocated to bin " << flow.m_binId);
         }
 
         // increase corresponding bin weight for this flow
-        NS_LOG_INFO("Flow " << flow.m_id << " bin change from " << oldBin << " to " << flow.m_binId);
+        if (flow.m_binId == flow.m_lastBinId)
+        {
+            NS_LOG_INFO("Flow " << flow.m_id << " no bin change and in bin " << flow.m_binId);
+        }
+        else
+        {
+            NS_LOG_INFO("Flow " << flow.m_id << " bin change from " << flow.m_lastBinId << " to " << flow.m_binId);
+        }
+
         m_bins[flow.m_binId]->IncreaseWeight(flow.m_weight);
     }
 
@@ -666,6 +741,10 @@ ABBCoDelQueueDisc::GetFlowInfo(Ptr<QueueDiscItem> item)
 
         // now increase the weight of the bin (0)
         m_bins[0]->IncreaseWeight(flowWeight);
+        if (m_bins[0]->GetStatus() != ABBCoDelBin::INACTIVE)
+        {
+            m_bins[0]->IncreaseDeficit(std::ceil(flowWeight * m_quantum));
+        }
     }
 
     FlowInfo& flow = m_flows[m_flowIndices[flowId]];
@@ -693,6 +772,8 @@ ABBCoDelQueueDisc::ABBCoDelDrop()
             maxBacklog = bytes;
             index = i;
         }
+        NS_LOG_DEBUG("Queue is full: subqueue " << i << ", bytes=" << bytes << ", maxBacklog=" << maxBacklog
+                        << ", Bin " << i << " status: " << m_bins[i]->GetStatus());
     }
 
     /* Our goal is to drop half of this fat bin backlog */
@@ -707,6 +788,10 @@ ABBCoDelQueueDisc::ABBCoDelDrop()
         NS_LOG_DEBUG("Drop packet (overflow); count: " << count << " len: " << len
                                                        << " threshold: " << threshold);
         item = qd->GetInternalQueue(0)->Dequeue();
+        FlowInfo& flow = GetFlowInfo(item);
+        uint32_t binId = flow.m_binId;
+        NS_LOG_DEBUG("Packet being dropped from bin " << binId << "; flow id " << flow.m_id
+                                                      << "; packet size " << item->GetSize());
         DropAfterDequeue(item, OVERLIMIT_DROP);
         len += item->GetSize();
     } while (++count < m_dropBatchSize && len < threshold);

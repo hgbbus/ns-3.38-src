@@ -138,6 +138,18 @@ class ABBCoDelBin : public QueueDiscClass
      */
     void IncreaseWeight(double weight);
 
+    /**
+     * @brief Save the weight of this bin in last interval
+     */
+    void SaveLastWeight();
+
+    /**
+     * @brief Get the weight of this bin in last interval
+     * 
+     * @return the weight of this bin in last interval 
+     */
+    double GetLastWeight() const;
+
   private:
     int32_t m_deficit;      //!< the deficit for this bin
     BinStatus m_status;     //!< the status of this bin
@@ -146,6 +158,7 @@ class ABBCoDelBin : public QueueDiscClass
     double m_bwthreshold;   //!< the bandwidth consumption threshold in units of mbps
     double m_weight;        //!< the weight for this bin is the sum of the weights 
                             //!< of all flows classified into this bin
+    double m_lastWeight;    //!< the weight of this bin in last interval
 };
 
 /**
@@ -213,6 +226,8 @@ class ABBCoDelQueueDisc : public QueueDisc
 
         /// The ID of the bin this flow is classified to
         uint32_t m_binId;
+        /// The ID of the bin this flow is classified to in last interval
+        uint32_t m_lastBinId;
         
         /// Internal flow allocation flag for flow reclassification
         bool m_alloced;
@@ -222,6 +237,9 @@ class ABBCoDelQueueDisc : public QueueDisc
 
         /// Average arrival rate (in units of mbps)
         double m_avgArrivalRate;
+
+        /// Count of consecutive intervals in which the flow is considered unresponsive, high rate
+        uint32_t m_hrCount;   // reset to 0 when the flow becomes responsive again
 
         // exponential moving average method is used:
         // https://en.wikipedia.org/wiki/Exponential_smoothing
